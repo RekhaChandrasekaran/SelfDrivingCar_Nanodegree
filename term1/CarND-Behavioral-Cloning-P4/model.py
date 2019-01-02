@@ -5,13 +5,13 @@ Script for creating and training a model
 
 import argparse
 import os
-import json
 import numpy as np
 import pandas as pd
 import cv2
 from sklearn.model_selection import train_test_split
 from keras.models import Sequential, load_model
-from keras.layers import Dense, Lambda, Convolution2D, MaxPooling2D, ELU, Dropout, Flatten
+from keras.layers import Dense, Lambda, Conv2D, MaxPooling2D, ELU, Dropout, Flatten, BatchNormalization
+from keras.optimizers import Adam
 
 # load data from training data file
 def load_data(csv_path, side_camera):
@@ -31,15 +31,18 @@ def load_data(csv_path, side_camera):
         center_data = data[['center', 'steering']]
         center_data.columns = new_columns
         
+        # adjust steering angle for left and right camera images        
         # left camera : use only right turn images
         left_data = data[['left', 'steering']]
         left_data.columns = new_columns
         left_data = left_data[left_data['steering'] > 0.0]
+        left_data['steering'] = left_data['steering'] + 0.1
         
         # right camera : use only left turn images
         right_data = data[['right', 'steering']]
         right_data.columns = new_columns
         right_data = right_data[right_data['steering'] < 0.0]
+        right_data['steering'] = right_data['steering'] - 0.1
         
         # combine
         data = pd.concat([center_data, left_data, right_data], axis=0, ignore_index=True)
@@ -60,43 +63,49 @@ def create_model():
     # Normalization
     model.add(Lambda(lambda x: x / 127.5 - 1.0, input_shape=(200, 66, 3)))
     
-    model.add(Convolution2D(24, 5, 5, subsample=(2, 2), border_mode='same'))
+    model.add(Conv2D(24, (5, 5), strides=(2, 2), padding="same"))    
     model.add(MaxPooling2D(pool_size = (2,2)))
-    model.add(Dropout(0.2))
+    model.add(BatchNormalization())
     model.add(ELU())
               
-    model.add(Convolution2D(36, 5, 5, subsample=(2, 2), border_mode='same'))
+    model.add(Conv2D(36, (5, 5), strides=(2, 2), padding="same")) 
+    model.add(BatchNormalization())
+    model.add(ELU())
+    
+    model.add(Conv2D(48, (5, 5), strides=(2, 2), padding="same")) 
+    model.add(BatchNormalization())
+    model.add(ELU())
+   
+    model.add(Conv2D(64, (3, 3), strides=(2, 2), padding="same")) 
+    model.add(BatchNormalization())
+    model.add(ELU())
+    
+    model.add(Conv2D(64, (3, 3), strides=(2, 2), padding="same")) 
+    model.add(BatchNormalization())
+    model.add(ELU()) 
+    
+    model.add(Flatten())
+    model.add(Dropout(0.2))
+    model.add(ELU())
+
+    model.add(Dense(1164))   
     model.add(Dropout(0.2))
     model.add(ELU())
     
-    model.add(Convolution2D(48, 5, 5, subsample=(2, 2), border_mode='same'))
-    model.add(Dropout(0.1))
-    model.add(ELU())
-    
-    model.add(Convolution2D(64, 3, 3, subsample=(2, 2), border_mode='same'))
-    model.add(Dropout(0.1))
-    model.add(ELU())
-    
-    model.add(Convolution2D(64, 3, 3, subsample=(2, 2), border_mode='same'))
-    model.add(Dropout(0.1))
-    model.add(ELU())    
-    
-    model.add(Flatten())
-
     model.add(Dense(100))   
     model.add(Dropout(0.5))
     model.add(ELU())
 
     model.add(Dense(50))    
-    model.add(Dropout(0.3))
+    model.add(Dropout(0.2))
     model.add(ELU())
 
     model.add(Dense(10))    
-    model.add(Dropout(0.3))
+    model.add(Dropout(0.2))
     model.add(ELU())
     model.add(Dense(1))
 
-    model.compile(optimizer='adam', loss='mse', metrics=['accuracy'])
+    model.compile(optimizer=Adam(1e-4), loss='mse', metrics=['accuracy'])
     
     return model
 
@@ -107,23 +116,21 @@ def load_image(img_path):
     image = image[70:, :, :]
     image = cv2.resize(image, (nvidia_h, nvidia_w))    
     # conver to YUV colorspace
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+    # image = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
     
     return image
 
 # custom data generator with data augmentation
-def image_data_generator(data_dir, X, y, batch_size=128):
+def image_data_generator(data_dir, X, y, batch_size=32):
     num_samples = len(X)
-    num_samples = num_samples - num_samples % batch_size
-    batch_per_epoch = num_samples/batch_size
+    batch_until_shuffle = num_samples//batch_size
     batch_counter, start_idx = 0, 0
     features = np.ndarray(shape=(batch_size, 200, 66, 3))
     labels = np.ndarray(shape=(batch_size,))
     
     while True:
-        # after a complete epoch
-        if (batch_counter % batch_per_epoch) == 0:
-            # shuffle
+        # shuffle after a complete parse of dataset
+        if (batch_counter % batch_until_shuffle) == 0:
             idx = np.arange(0, num_samples)
             np.random.shuffle(idx)
             X = X[idx]
@@ -133,25 +140,18 @@ def image_data_generator(data_dir, X, y, batch_size=128):
             img_path, label = X[i], y[i]
             img_path = img_path.strip()
             img_path = data_dir + '/' + img_path
-            # adjust steering angle for left and right camera images
-            if 'left' in img_path:
-                label += 0.1
-            if 'right' in img_path:
-                label -= 0.1
-                
             features[i % batch_size] = load_image(img_path)
             labels[i % batch_size] = label
         batch_counter += 1
-        start_idx += batch_size
-        
+        start_idx += batch_size        
         yield (features, labels)
-
+        
 if __name__=='__main__':    
     # Argument Parser
     parser = argparse.ArgumentParser(description='Behavioral Cloning : Steering Angle Prediction')
     parser.add_argument('--data_dir', action = 'store', dest='data_dir', type=str, default='../../../opt/carnd_p3/data', help='Provide path to training data')
     parser.add_argument('--epochs', action = 'store', dest='epochs', type=int, default=5, help='Number of Epochs')
-    parser.add_argument('--batch_size', action = 'store', dest='batch_size', type=int, default=128, help='Training Batch Size')
+    parser.add_argument('--batch_size', action = 'store', dest='batch_size', type=int, default=32, help='Training Batch Size')
     parser.add_argument('--side_camera', action = 'store_true', dest='side_camera', help='Train using left and right camera images too')
     parser.add_argument('--continue_training', action = 'store_true', dest='continue_training', help='Continue training from the previous model')
     parser.add_argument('--model_file', action = 'store', dest='model_file', type=str, default='model.h5', help='Model destination')
@@ -196,10 +196,14 @@ if __name__=='__main__':
     else:
         model = create_model()
     print(model.summary())
-    samples_per_epoch = train_size - train_size % batch_size
-    model.fit_generator(image_data_generator(data_dir, X_train, y_train, batch_size), steps_per_epoch=train_size//batch_size,
-                        epochs=epochs, validation_data=image_data_generator(data_dir, X_valid, y_valid, valid_size),
-                        validation_steps = valid_size//batch_size)
+    steps_per_epoch = train_size//batch_size
+    validation_steps = valid_size//batch_size
+    
+    #todo history & verbose
+    model.fit_generator(image_data_generator(data_dir, X_train, y_train, batch_size), steps_per_epoch=steps_per_epoch,
+                        epochs=epochs, validation_data=image_data_generator(data_dir, X_valid, y_valid, batch_size),
+                        validation_steps=validation_steps)
+   
     
     # update model file
     if os.path.isfile(model_file):
