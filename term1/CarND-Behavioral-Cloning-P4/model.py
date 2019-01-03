@@ -7,11 +7,14 @@ import argparse
 import os
 import numpy as np
 import pandas as pd
+import random
 import cv2
 from sklearn.model_selection import train_test_split
 from keras.models import Sequential, load_model
 from keras.layers import Dense, Lambda, Conv2D, MaxPooling2D, ELU, Dropout, Flatten, BatchNormalization
-from keras.optimizers import Adam
+from keras.regularizers import l2
+
+STEERING_OFFSET = 0.25
 
 # load data from training data file
 def load_data(csv_path, side_camera):
@@ -32,17 +35,17 @@ def load_data(csv_path, side_camera):
         center_data.columns = new_columns
         
         # adjust steering angle for left and right camera images        
-        # left camera : use only right turn images
+        # left camera
         left_data = data[['left', 'steering']]
         left_data.columns = new_columns
-        left_data = left_data[left_data['steering'] > 0.0]
-        left_data['steering'] = left_data['steering'] + 0.1
+        # left_data = left_data[left_data['steering'] > 0.0]
+        left_data['steering'] = left_data['steering'] + STEERING_OFFSET
         
-        # right camera : use only left turn images
+        # right camera
         right_data = data[['right', 'steering']]
         right_data.columns = new_columns
-        right_data = right_data[right_data['steering'] < 0.0]
-        right_data['steering'] = right_data['steering'] - 0.1
+        # right_data = right_data[right_data['steering'] < 0.0]
+        right_data['steering'] = right_data['steering'] - STEERING_OFFSET
         
         # combine
         data = pd.concat([center_data, left_data, right_data], axis=0, ignore_index=True)
@@ -57,78 +60,81 @@ def load_data(csv_path, side_camera):
     
     return X, y
 
+
 # create a model based on reference paper. See report.
 def create_model():
     model = Sequential()
-    # Normalization
-    model.add(Lambda(lambda x: x / 127.5 - 1.0, input_shape=(200, 66, 3)))
+    # Normalization (-1 to 1)
+    model.add(Lambda(lambda x: x / 127.5 - 1.0, input_shape=(160, 320, 3)))
     
-    model.add(Conv2D(24, (5, 5), strides=(2, 2), padding="same"))    
-    model.add(MaxPooling2D(pool_size = (2,2)))
+    model.add(Conv2D(24, (5, 5), strides=(2, 2), padding="valid", kernel_initializer='he_normal'))    
+    # model.add(MaxPooling2D(pool_size = (2,2)))
     model.add(BatchNormalization())
     model.add(ELU())
               
-    model.add(Conv2D(36, (5, 5), strides=(2, 2), padding="same")) 
+    model.add(Conv2D(36, (5, 5), strides=(2, 2), padding="valid", kernel_initializer='he_normal')) 
     model.add(BatchNormalization())
     model.add(ELU())
     
-    model.add(Conv2D(48, (5, 5), strides=(2, 2), padding="same")) 
+    model.add(Conv2D(48, (5, 5), strides=(2, 2), padding="valid", kernel_initializer='he_normal')) 
     model.add(BatchNormalization())
     model.add(ELU())
    
-    model.add(Conv2D(64, (3, 3), strides=(2, 2), padding="same")) 
+    model.add(Conv2D(64, (3, 3), strides=(1, 1), padding="valid", kernel_initializer='he_normal')) 
     model.add(BatchNormalization())
     model.add(ELU())
     
-    model.add(Conv2D(64, (3, 3), strides=(2, 2), padding="same")) 
+    model.add(Conv2D(64, (3, 3), strides=(1, 1), padding="valid", kernel_initializer='he_normal')) 
     model.add(BatchNormalization())
     model.add(ELU()) 
     
     model.add(Flatten())
-    model.add(Dropout(0.2))
-    model.add(ELU())
-
-    model.add(Dense(1164))   
-    model.add(Dropout(0.2))
+    model.add(Dropout(0.3))
     model.add(ELU())
     
-    model.add(Dense(100))   
+    model.add(Dense(100, kernel_initializer='he_normal', kernel_regularizer=l2(0.001)))
     model.add(Dropout(0.5))
     model.add(ELU())
 
-    model.add(Dense(50))    
-    model.add(Dropout(0.2))
+    model.add(Dense(50, kernel_initializer='he_normal', kernel_regularizer=l2(0.001)))
+    model.add(Dropout(0.5))
     model.add(ELU())
 
-    model.add(Dense(10))    
-    model.add(Dropout(0.2))
+    model.add(Dense(10, kernel_initializer='he_normal', kernel_regularizer=l2(0.001)))
+    model.add(Dropout(0.5))
     model.add(ELU())
-    model.add(Dense(1))
-
-    model.compile(optimizer=Adam(1e-4), loss='mse', metrics=['accuracy'])
+    model.add(Dense(1, activation='linear', kernel_initializer='he_normal'))
+    
+    model.compile(optimizer='adam', loss='mse')
     
     return model
 
 def load_image(img_path):
-    nvidia_h, nvidia_w = 66, 200
-    image = cv2.imread(img_path)
+    nvidia_w, nvidia_h = 320, 160
+    image = cv2.imread(img_path) 
+    
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
     # crop the sky at the top of the image
-    image = image[70:, :, :]
-    image = cv2.resize(image, (nvidia_h, nvidia_w))    
-    # conver to YUV colorspace
-    # image = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+    image = image[70:-20]
+    
+    image = cv2.resize(image, (nvidia_w, nvidia_h), interpolation=cv2.INTER_AREA)
     
     return image
-
+        
 # custom data generator with data augmentation
 def image_data_generator(data_dir, X, y, batch_size=32):
     num_samples = len(X)
     batch_until_shuffle = num_samples//batch_size
-    batch_counter, start_idx = 0, 0
-    features = np.ndarray(shape=(batch_size, 200, 66, 3))
-    labels = np.ndarray(shape=(batch_size,))
     
+    batch_counter, start_idx = 0, 0
+    center_image_limit = batch_size//2
+    center_image_counter = 0
+        
     while True:
+        features = []
+        labels = []
+        
         # shuffle after a complete parse of dataset
         if (batch_counter % batch_until_shuffle) == 0:
             idx = np.arange(0, num_samples)
@@ -138,12 +144,42 @@ def image_data_generator(data_dir, X, y, batch_size=32):
             start_idx = 0
         for i in range(start_idx, start_idx + batch_size):
             img_path, label = X[i], y[i]
+            
+            # limit the number of 'steering => 0' images in each batch 
+            # i.e boost the number of side_camera images
+            if abs(label) < 0.1:
+                center_image_counter += 1
+            if center_image_counter > center_image_limit:
+                random_idx = random.choice(range(0, num_samples))
+                while abs(y[random_idx] < 0.1):
+                    random_idx = random.choice(range(0, num_samples))
+                img_path, label = X[random_idx], y[random_idx]
+                
             img_path = img_path.strip()
             img_path = data_dir + '/' + img_path
-            features[i % batch_size] = load_image(img_path)
-            labels[i % batch_size] = label
+            image = load_image(img_path)
+            image = np.array(image, dtype=np.float32)
+            
+            features.append(image)
+            labels.append(label)
+            
+            # data augmentation - flip images
+            features.append(np.fliplr(image))
+            labels.append(-label)
+            
         batch_counter += 1
         start_idx += batch_size        
+        
+        features = np.array(features, dtype=np.float32)
+        labels = np.array(labels, dtype=np.float32)
+        
+        # shuffle images (original and flipped) to ensure no bias was introduced with the order of training images
+        img_indices = np.arange(features.shape[0])
+        np.random.shuffle(img_indices)
+        
+        features = features[img_indices]
+        labels = labels[img_indices]
+        
         yield (features, labels)
         
 if __name__=='__main__':    
@@ -178,6 +214,7 @@ if __name__=='__main__':
     
     # load training data
     csv_path = data_dir + '/driving_log.csv'
+    
     print('Loading data from file: {}'.format(csv_path))
     X, y = load_data(csv_path, side_camera)
     
@@ -195,14 +232,15 @@ if __name__=='__main__':
         model = load_model(model_file)
     else:
         model = create_model()
+        
     print(model.summary())
+    
     steps_per_epoch = train_size//batch_size
     validation_steps = valid_size//batch_size
     
-    #todo history & verbose
-    model.fit_generator(image_data_generator(data_dir, X_train, y_train, batch_size), steps_per_epoch=steps_per_epoch,
+    history = model.fit_generator(image_data_generator(data_dir, X_train, y_train, batch_size), steps_per_epoch=steps_per_epoch,
                         epochs=epochs, validation_data=image_data_generator(data_dir, X_valid, y_valid, batch_size),
-                        validation_steps=validation_steps)
+                        validation_steps=validation_steps, verbose=1)
    
     
     # update model file
